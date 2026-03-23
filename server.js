@@ -1,34 +1,19 @@
-// ============================================================
-//  QR Registration System — Node.js + MySQL API Server
-//  Usage: node server.js
-//  Accessible by ALL devices on the same LAN at http://<this-PC-IP>:3000
-// ============================================================
-
 const express = require('express');
-const mysql = require('mysql2/promise');
+const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
 const path = require('path');
 
-// ── Fetch Polyfill (For older Node.js versions) ──────────────
-if (typeof fetch === 'undefined') {
-    global.fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
-}
+// ── Load Environment Variables ─────────────────────────────
+require('dotenv').config();
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
-// ── MySQL Connection Pool ────────────────────────────────────
-// This works for BOTH Localhost and Cloud (Aiven/Railway)
-const pool = mysql.createPool({
-    host: process.env.DB_HOST || 'localhost',
-    user: process.env.DB_USER || 'root',
-    password: process.env.DB_PASSWORD || '',
-    database: process.env.DB_NAME || 'qr_system',
-    ssl: process.env.DB_HOST ? { rejectUnauthorized: false } : null,
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0
-});
+// ── Supabase Client Initialization ─────────────────────────
+const supabase = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_ANON_KEY
+);
 
 // ── Middleware ───────────────────────────────────────────────
 app.use(cors());
@@ -48,7 +33,6 @@ app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-
 // ── Endpoints ────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
     res.json({ ok: true, time: new Date().toISOString() });
@@ -61,8 +45,14 @@ app.get('/display', (req, res) => {
 // GUESTS 
 app.get('/api/guests', async (req, res) => {
     try {
-        const [rows] = await pool.query('SELECT * FROM guests ORDER BY name');
-        const guests = rows.map(r => ({
+        const { data, error } = await supabase
+            .from('guests')
+            .select('*')
+            .order('name');
+
+        if (error) throw error;
+        
+        const guests = data.map(r => ({
             id: r.id,
             Name: r.name,
             Department: r.department,
@@ -79,29 +69,40 @@ app.get('/api/guests', async (req, res) => {
 app.post('/api/guests', async (req, res) => {
     const guests = req.body;
     if (!Array.isArray(guests)) return res.status(400).json({ error: 'Expected array' });
-    const conn = await pool.getConnection();
     try {
-        await conn.beginTransaction();
-        await conn.query('DELETE FROM guests');
+        // Step 1: Clear existing guests
+        await supabase.from('guests').delete().neq('id', '00000000-0000-0000-0000-000000000000'); // Delete all
+
+        // Step 2: Insert new ones
         if (guests.length > 0) {
-            const values = guests.map(g => [g.id, g.Name || '', g.Department || '', g['Job Title'] || '', g['Table Number'] || '', g.Email || g.gmail || '']);
-            await conn.query('INSERT INTO guests (id, name, department, job_title, table_number, gmail) VALUES ?', [values]);
+            const values = guests.map(g => ({
+                id: g.id,
+                name: g.Name || '',
+                department: g.Department || '',
+                job_title: g['Job Title'] || '',
+                table_number: String(g['Table Number'] || ''),
+                gmail: g.Email || g.gmail || ''
+            }));
+            const { error } = await supabase.from('guests').insert(values);
+            if (error) throw error;
         }
-        await conn.commit();
         res.json({ ok: true });
     } catch (err) {
-        await conn.rollback();
         res.status(500).json({ error: err.message });
-    } finally {
-        conn.release();
     }
 });
 
 // REGISTRATIONS
 app.get('/api/registrations', async (req, res) => {
     try {
-        const [rows] = await pool.query('SELECT * FROM registrations ORDER BY created_at DESC');
-        const regs = rows.map(r => ({
+        const { data, error } = await supabase
+            .from('registrations')
+            .select('*')
+            .order('created_at', { ascending: false });
+
+        if (error) throw error;
+
+        const regs = data.map(r => ({
             id: r.scan_id || String(r.id),
             tableNo: r.table_no,
             scanData: r.scan_data,
@@ -120,16 +121,27 @@ app.post('/api/registrations', async (req, res) => {
     try {
         // If it's a known guest (has guestId), check for existing registration first
         if (r.guestId) {
-            const [existing] = await pool.query('SELECT id FROM registrations WHERE guest_id = ?', [r.guestId]);
-            if (existing.length > 0) {
+            const { data: existing } = await supabase
+                .from('registrations')
+                .select('id')
+                .eq('guest_id', r.guestId);
+            
+            if (existing && existing.length > 0) {
                 return res.status(409).json({ error: 'Guest already registered' });
             }
         }
 
-        await pool.query(
-            `INSERT INTO registrations (scan_id, guest_id, scan_data, department, table_no, timestamp) VALUES (?, ?, ?, ?, ?, ?)`,
-            [String(r.id || Date.now()), r.guestId || null, r.scanData, r.department || '', String(r.tableNo || ''), r.timestamp || new Date().toLocaleString()]
-        );
+        const { error } = await supabase.from('registrations').insert([
+            {
+                scan_id: String(r.id || Date.now()),
+                guest_id: r.guestId || null,
+                scan_data: r.scanData,
+                department: r.department || '',
+                table_no: String(r.tableNo || ''),
+                timestamp: r.timestamp || new Date().toLocaleString()
+            }
+        ]);
+        if (error) throw error;
         res.json({ ok: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -138,7 +150,8 @@ app.post('/api/registrations', async (req, res) => {
 
 app.delete('/api/registrations', async (req, res) => {
     try {
-        await pool.query('DELETE FROM registrations');
+        const { error } = await supabase.from('registrations').delete().neq('id', 0);
+        if (error) throw error;
         res.json({ ok: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -147,7 +160,8 @@ app.delete('/api/registrations', async (req, res) => {
 
 app.delete('/api/registrations/:id', async (req, res) => {
     try {
-        await pool.query('DELETE FROM registrations WHERE scan_id = ?', [String(req.params.id)]);
+        const { error } = await supabase.from('registrations').delete().eq('scan_id', req.params.id);
+        if (error) throw error;
         res.json({ ok: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
