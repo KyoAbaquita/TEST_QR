@@ -1,12 +1,11 @@
 // ============================================================
-//  QR Registration System — Node.js + Supabase (PostgreSQL) API Server
+//  QR Registration System — Node.js + MySQL API Server
 //  Usage: node server.js
 //  Accessible by ALL devices on the same LAN at http://<this-PC-IP>:3000
 // ============================================================
 
-require('dotenv').config();
 const express = require('express');
-const { createClient } = require('@supabase/supabase-js');
+const mysql = require('mysql2/promise');
 const cors = require('cors');
 const path = require('path');
 
@@ -16,18 +15,20 @@ if (typeof fetch === 'undefined') {
 }
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = 3000;
 
-// ── Supabase Setup ───────────────────────────────────────────
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_ANON_KEY;
-
-if (!supabaseUrl || !supabaseKey) {
-    console.error("❌ ERROR: SUPABASE_URL and SUPABASE_ANON_KEY must be set in .env");
-    process.exit(1);
-}
-
-const supabase = createClient(supabaseUrl, supabaseKey);
+// ── MySQL Connection Pool ────────────────────────────────────
+// This works for BOTH Localhost and Cloud (Aiven/Railway)
+const pool = mysql.createPool({
+    host: process.env.DB_HOST || 'localhost',
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD || '',
+    database: process.env.DB_NAME || 'qr_system',
+    ssl: process.env.DB_HOST ? { rejectUnauthorized: false } : null,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
+});
 
 // ── Middleware ───────────────────────────────────────────────
 app.use(cors());
@@ -42,7 +43,7 @@ app.use((req, res, next) => {
 
 app.use(express.static(path.join(__dirname)));
 
-// Serve index.html for the root route
+// ── Root Route (Fixes "Cannot GET /") ────────────────────────
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
@@ -60,14 +61,8 @@ app.get('/display', (req, res) => {
 // GUESTS 
 app.get('/api/guests', async (req, res) => {
     try {
-        const { data, error } = await supabase
-            .from('guests')
-            .select('*')
-            .order('name');
-
-        if (error) throw error;
-
-        const guests = data.map(r => ({
+        const [rows] = await pool.query('SELECT * FROM guests ORDER BY name');
+        const guests = rows.map(r => ({
             id: r.id,
             Name: r.name,
             Department: r.department,
@@ -84,49 +79,29 @@ app.get('/api/guests', async (req, res) => {
 app.post('/api/guests', async (req, res) => {
     const guests = req.body;
     if (!Array.isArray(guests)) return res.status(400).json({ error: 'Expected array' });
-
+    const conn = await pool.getConnection();
     try {
-        // Truncate table: In Supabase/PostgreSQL, we can delete all rows
-        const { error: deleteError } = await supabase
-            .from('guests')
-            .delete()
-            .neq('id', ''); // Delete all rows where id is not empty (effectively all)
-
-        if (deleteError) throw deleteError;
-
+        await conn.beginTransaction();
+        await conn.query('DELETE FROM guests');
         if (guests.length > 0) {
-            const values = guests.map(g => ({
-                id: String(g.id),
-                name: g.Name || '',
-                department: g.Department || '',
-                job_title: g['Job Title'] || '',
-                table_number: String(g['Table Number'] || ''),
-                gmail: g.Email || g.gmail || ''
-            }));
-
-            const { error: insertError } = await supabase
-                .from('guests')
-                .insert(values);
-
-            if (insertError) throw insertError;
+            const values = guests.map(g => [g.id, g.Name || '', g.Department || '', g['Job Title'] || '', g['Table Number'] || '', g.Email || g.gmail || '']);
+            await conn.query('INSERT INTO guests (id, name, department, job_title, table_number, gmail) VALUES ?', [values]);
         }
+        await conn.commit();
         res.json({ ok: true });
     } catch (err) {
+        await conn.rollback();
         res.status(500).json({ error: err.message });
+    } finally {
+        conn.release();
     }
 });
 
 // REGISTRATIONS
 app.get('/api/registrations', async (req, res) => {
     try {
-        const { data, error } = await supabase
-            .from('registrations')
-            .select('*')
-            .order('created_at', { ascending: false });
-
-        if (error) throw error;
-
-        const regs = data.map(r => ({
+        const [rows] = await pool.query('SELECT * FROM registrations ORDER BY created_at DESC');
+        const regs = rows.map(r => ({
             id: r.scan_id || String(r.id),
             tableNo: r.table_no,
             scanData: r.scan_data,
@@ -143,18 +118,18 @@ app.get('/api/registrations', async (req, res) => {
 app.post('/api/registrations', async (req, res) => {
     const r = req.body;
     try {
-        const { error } = await supabase
-            .from('registrations')
-            .insert([{
-                scan_id: String(r.id || Date.now()),
-                guest_id: r.guestId || null,
-                scan_data: r.scanData,
-                department: r.department || '',
-                table_no: String(r.tableNo || ''),
-                timestamp: r.timestamp || new Date().toLocaleString()
-            }]);
+        // If it's a known guest (has guestId), check for existing registration first
+        if (r.guestId) {
+            const [existing] = await pool.query('SELECT id FROM registrations WHERE guest_id = ?', [r.guestId]);
+            if (existing.length > 0) {
+                return res.status(409).json({ error: 'Guest already registered' });
+            }
+        }
 
-        if (error) throw error;
+        await pool.query(
+            `INSERT INTO registrations (scan_id, guest_id, scan_data, department, table_no, timestamp) VALUES (?, ?, ?, ?, ?, ?)`,
+            [String(r.id || Date.now()), r.guestId || null, r.scanData, r.department || '', String(r.tableNo || ''), r.timestamp || new Date().toLocaleString()]
+        );
         res.json({ ok: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -163,12 +138,7 @@ app.post('/api/registrations', async (req, res) => {
 
 app.delete('/api/registrations', async (req, res) => {
     try {
-        const { error } = await supabase
-            .from('registrations')
-            .delete()
-            .gt('id', -1); // Delete all where id > -1 (effectively all)
-
-        if (error) throw error;
+        await pool.query('DELETE FROM registrations');
         res.json({ ok: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -177,12 +147,7 @@ app.delete('/api/registrations', async (req, res) => {
 
 app.delete('/api/registrations/:id', async (req, res) => {
     try {
-        const { error } = await supabase
-            .from('registrations')
-            .delete()
-            .eq('scan_id', String(req.params.id));
-
-        if (error) throw error;
+        await pool.query('DELETE FROM registrations WHERE scan_id = ?', [String(req.params.id)]);
         res.json({ ok: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -195,6 +160,7 @@ app.delete('/api/registrations/:id', async (req, res) => {
 app.post('/api/send-email', async (req, res) => {
     const { toEmail, toName, toJob, toDept, qrData } = req.body;
 
+    // ⚠️ PASTE YOUR NEW BREVO KEY HERE ⚠️
     const BREVO_API_KEY = process.env.BREVO_API_KEY || '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';
     const SENDER_EMAIL = 'pitogojohncarlo50@gmail.com';
     const SENDER_NAME = 'SLU J&T Event Registration';
@@ -219,19 +185,19 @@ app.post('/api/send-email', async (req, res) => {
                 <p>Hello Mr/Ms. <b>${toName || 'Guest'}</b>,</p>
                 <p>You are cordially invited to an evening of celebration and recognition as we commemorate seven years of excellence and success.</p>
                 
-                <br/> 
+                </br> 
 
                 <h2 style="color: #6c63ff; text-align: left;">Event Details</h2>
                 <p><b>Date:</b> March 28, 2026 (Saturday)</p>
-                <p><b>Registration Opens:</b> 3:30 PM</p>
+                <p><b>Registration Opens:</b> 4:00 PM</p>
                 <p><b>Venue:</b> Enchanting Events Place</p>
                 <p>Enchanted Kingdom, Santa Rosa City, Laguna</p>
                 
-                <br/> 
+                </br> 
 
                 <h2 style="color: #6c63ff; text-align: center;">Attire Guidlines:</h2>
                 <p style="text-align: center"> <b> Formal Attire - Hollywood Themed</b></p>
-                <br/>
+                </br>
                 <p style="text-align: center"> Please choose outfits in any shade of the following colors:</p>
                 <p style="text-align: center"> <b> Black, Red, Blue, Gold, Silver, Brown, or White.</b></p>
                 
@@ -272,17 +238,10 @@ app.post('/api/send-email', async (req, res) => {
     }
 });
 
-// ════════════════════════════════════════════════════════════
-//  START SERVER (Local only)
-// ════════════════════════════════════════════════════════════
-// ════════════════════════════════════════════════════════════
-//  START SERVER (Local only)
-// ════════════════════════════════════════════════════════════
-if (require.main === module) {
-    app.listen(PORT, '0.0.0.0', () => {
-        console.log(`✅ Server running at http://localhost:${PORT}`);
-    });
-}
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`✅ Server running at http://localhost:${PORT}`);
+});
 
-// Export for Vercel / Tests
+// Export for Vercel
 module.exports = app;
+

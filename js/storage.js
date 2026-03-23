@@ -1,5 +1,5 @@
 // ============================================================
-//  storage.js — API-backed storage (Supabase via server.js)
+//  storage.js — API-backed storage (MySQL via server.js)
 //  Falls back to localStorage when the server is unreachable
 // ============================================================
 
@@ -73,6 +73,24 @@ async function loadData() {
     updateStats();
 }
 
+// ── Live Sync (Polling) ───────────────────────────────────
+async function syncRegistrations() {
+    try {
+        const fetchedRegs = await apiFetch('/api/registrations');
+        
+        // Only update if the number of records has changed
+        if (fetchedRegs.length !== registrations.length) {
+            console.log("🔄 Background sync: Updating records...");
+            registrations = fetchedRegs;
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(registrations));
+            renderTable(false);
+            updateStats();
+        }
+    } catch (err) {
+        // Silently fail background sync to avoid annoying popups
+    }
+}
+
 // ════════════════════════════════════════════════════════════
 //  SAVE REGISTRATIONS (Offline-Aware)
 // ════════════════════════════════════════════════════════════
@@ -83,13 +101,24 @@ async function saveData() {
     const newestRecord = registrations[0];
 
     try {
-        await apiFetch('/api/registrations', {
+        const res = await fetch(API_BASE + '/api/registrations', {
             method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(newestRecord)
         });
+
+        if (res.status === 409) {
+            // Already registered on another device!
+            showToast('⚠️ Already scanned on another device', 'warn');
+            syncRegistrations(); // Refresh list immediately
+            return;
+        }
+
+        if (!res.ok) throw new Error('Sync failed');
+        
         setDbStatus(true);
     } catch (err) {
-        // ADD TO QUEUE IF FAILED
+        // ADD TO QUEUE IF FAILED (and not a 409 conflict)
         addToSyncQueue(newestRecord);
         setDbStatus(false);
         showToast('📍 Saved locally (will sync later)', '');
